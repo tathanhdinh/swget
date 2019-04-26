@@ -15,7 +15,7 @@ use rayon::prelude::*;
 static DEFAULT_UA: &str =
     "Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:66.0) Gecko/20100101 Firefox/66.0";
 
-static BUFFER_SIZE: usize = 512 * 1024;
+static BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 fn get_name(client: &Client, url: Url) -> Option<String> {
     let resp = client.head(url)
@@ -58,9 +58,10 @@ fn get_ranged_data(client: &Client, url: Url, range: (usize, usize)) -> Option<B
                           .send()
                           .ok()?;
     if resp.status() == StatusCode::PARTIAL_CONTENT {
-        let mut buffer = vec![0u8; 2 * (range.1 - range.0)];
-        let copied = resp.copy_to(&mut buffer).ok()?;
-        buffer.resize(copied as usize, 0u8);
+        // let mut buffer = vec![0u8; 2 * (range.1 - range.0)];
+        let mut buffer: Vec<_> = Vec::with_capacity(2 * BUFFER_SIZE);
+        resp.copy_to(&mut buffer).ok()?;
+        // buffer.resize(copied as usize, 0u8);
         Some(buffer.into_boxed_slice())
     } else {
         None
