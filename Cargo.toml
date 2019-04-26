@@ -1,0 +1,10 @@
+[package]
+name = "swget"
+version = "0.1.0"
+authors = ["TA Thanh Dinh <tathanhdinh@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+reqwest = "*"
+indicatif = "*"
+rayon = "*"
