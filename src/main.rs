@@ -1,161 +1,200 @@
 #![allow(dead_code)]
 
 use std::{
-    env,
-    fs::File,
-    io::{BufWriter, Read, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
+    time::Instant,
 };
 
-use reqwest::{header, Client, StatusCode, Url};
+use reqwest::{header, Client, IntoUrl, StatusCode, Url};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
 
 use rayon::prelude::*;
+
+use structopt::StructOpt;
 
 static DEFAULT_UA: &str =
     "Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:66.0) Gecko/20100101 Firefox/66.0";
 
-static BUFFER_SIZE: usize = 512 * 1024;
+static BUFFER_SIZE: usize = 1024 * 1024;
 
-fn get_name(client: &Client, url: Url) -> Option<String> {
-    let resp = client.head(url)
-                     .header(header::USER_AGENT, DEFAULT_UA)
-                     .send()
-                     .ok()?;
-    if resp.status().is_success() {
-        if let Some(ct_disp) = resp.headers().get(header::CONTENT_DISPOSITION) {
-            if !ct_disp.is_empty() {
-                let name = ct_disp.to_str().ok()?;
-                return Some(name.to_owned())
+pub struct RemoteFile {
+    pub url: Url,
+    pub name: PathBuf,
+    pub length: usize,
+    client: Client,
+}
+
+impl RemoteFile {
+    fn from(url: &str) -> Option<Self> {
+        let url = Url::parse(url).ok()?;
+        let client = Client::new();
+        let resp = client.head(url)
+                         .header(header::USER_AGENT, DEFAULT_UA)
+                         .send()
+                         .ok()?;
+        let url = resp.url();
+        let length = resp.content_length()? as usize;
+        let mut name = None;
+        if resp.status().is_success() {
+            if let Some(ctd) = resp.headers().get(header::CONTENT_DISPOSITION) {
+                if !ctd.is_empty() {
+                    if let Ok(ctd) = ctd.to_str() {
+                        let vs: Vec<_> = ctd.split(';').collect();
+                        if let Some(fv) = vs.iter().find(|v| v.contains("filename")) {
+                            let fvs: Vec<_> = fv.split('=').collect();
+                            if fvs.len() == 2 {
+                                name = Some(PathBuf::from(fvs[1]));
+                            }
+                        }
+                    }
+                }
+            } else {
+                name = Some(PathBuf::from(url.path()));
             }
+        }
+
+        if !name.is_none() {
+            Some(RemoteFile { url: url.to_owned(),
+                              name: name.unwrap(),
+                              length,
+                              client })
         } else {
-            let url = resp.url().as_str();
-            let name_pos = url.rfind("/")? + 1;
-            return Some(url[name_pos..].to_owned())
+            None
         }
     }
 
-    None
-}
+    fn download(&self, w: &mut impl Write) -> Option<&Path> {
+        fn get_ranged_data(client: &Client,
+                           url: impl IntoUrl,
+                           range: (usize, usize))
+                           -> Option<Box<[u8]>> {
+            let range_content = format!("bytes={}-{}", range.0, range.1 - 1);
+            let resp = &mut client.get(url)
+                                  .header(header::USER_AGENT, DEFAULT_UA)
+                                  .header(header::RANGE, range_content.as_str())
+                                  .send()
+                                  .ok()?;
+            if resp.status() == StatusCode::PARTIAL_CONTENT {
+                let mut buffer: Vec<_> = Vec::with_capacity(2 * BUFFER_SIZE);
+                resp.copy_to(&mut buffer).ok()?;
+                Some(buffer.into_boxed_slice())
+            } else {
+                None
+            }
+        }
 
-fn get_length(client: &Client, url: Url) -> Option<usize> {
-    let resp = &mut client.get(url)
-                          .header(header::USER_AGENT, DEFAULT_UA)
-                          .send()
-                          .ok()?;
-    if resp.status().is_success() {
-        Some(resp.content_length()? as usize)
-    } else {
-        None
+        let ranges = {
+            let mut ranges: Vec<_> =
+                (0..(self.length / BUFFER_SIZE)).map(|i| (i * BUFFER_SIZE, (i + 1) * BUFFER_SIZE))
+                                                .collect();
+            ranges.push((BUFFER_SIZE * (self.length / BUFFER_SIZE), self.length));
+            ranges
+        };
+
+        let data: Option<Vec<_>> =
+            ranges.par_iter()
+                  .map(|(from, to)| get_ranged_data(&self.client, self.url.clone(), (*from, *to)))
+                  .collect();
+
+        if let Some(buffers) = data {
+            let mut saved_length = 0usize;
+            for b in buffers {
+                w.write_all(&b).ok()?;
+                saved_length += b.len();
+            }
+            assert_eq!(self.length, saved_length);
+
+            Some(self.name.as_path())
+        } else {
+            None
+        }
     }
 }
 
-fn get_ranged_data(client: &Client, url: Url, range: (usize, usize)) -> Option<Box<[u8]>> {
-    let range_content = format!("bytes={}-{}", range.0, range.1 - 1);
-    let resp = &mut client.get(url)
-                          .header(header::USER_AGENT, DEFAULT_UA)
-                          .header(header::RANGE, range_content.as_str())
-                          .send()
-                          .ok()?;
-    if resp.status() == StatusCode::PARTIAL_CONTENT {
-        let mut buffer = vec![0u8; 2 * (range.1 - range.0)];
-        let copied = resp.copy_to(&mut buffer).ok()?;
-        buffer.resize(copied as usize, 0u8);
-        Some(buffer.into_boxed_slice())
-    } else {
-        None
-    }
+#[derive(Debug, StructOpt)]
+struct Opt {
+    #[structopt(parse(from_os_str))]
+    file: PathBuf,
+
+    #[structopt(short = "o",
+                long = "output",
+                help = "output folder for downloaded files [default: current folder]",
+                parse(from_os_str))]
+    out: Option<PathBuf>,
+
+    #[structopt(long = "log",
+                help = "log file",
+                default_value = "downloaded_files.log")]
+    log: PathBuf,
+
+    #[structopt(long = "server",
+                help = "PDB server url",
+                default_value = "https://msdl.microsoft.com/download/symbols")]
+    server: String,
 }
 
-fn concurrent_download(url: &str) -> Option<String> {
-    let url = Url::parse(url).ok()?;
-    let client = &Client::new();
-    let name = get_name(client, url.clone())?;
-    let length = get_length(client, url.clone())?;
+fn main() -> Result<(), io::Error> {
+    let opt = Opt::from_args();
 
-    let ranges = {
-        let mut ranges: Vec<_> =
-            (0..(length / BUFFER_SIZE)).map(|i| (i * BUFFER_SIZE, (i + 1) * BUFFER_SIZE))
-                                       .collect();
-        ranges.push((BUFFER_SIZE * (length / BUFFER_SIZE), length));
-        ranges
-    };
+    let started = Instant::now();
 
-    let pb = ProgressBar::new(length as u64);
+    let uris: Vec<_> = BufReader::new(File::open(&opt.file)?).lines()
+                                                             .map(|l| l.unwrap())
+                                                             .collect();
+
+    let pb = ProgressBar::new(uris.len() as u64);
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
         .progress_chars("#>-"));
 
-    let data: Option<Vec<_>> = ranges.par_iter()
-                                     .map(|(from, to)| {
-                                         pb.inc((*to - *from) as u64);
-                                         get_ranged_data(client, url.clone(), (*from, *to))
-                                     })
-                                     .collect();
+    let ok_uris: Vec<_> = uris.par_iter()
+                              .map(|uri| -> Option<&str> {
+                                  let uri = uri.as_str();
 
-    if let Some(buffers) = data {
-        let file = &mut BufWriter::new(File::create(name.as_str()).ok()?);
+                                  let file_path = if let Some(outdir) = &opt.out {
+                                      let mut p = outdir.clone();
+                                      p.push(uri);
+                                      p
+                                  } else {
+                                      PathBuf::from(uri)
+                                  };
 
-        let mut saved_length = 0usize;
-        for b in buffers {
-            file.write_all(&b).ok()?;
-            saved_length += b.len();
-        }
-        assert_eq!(length, saved_length);
+                                  fs::create_dir_all(file_path.parent()?).ok()?;
 
-        Some(name)
+                                  let local_file =
+                                      &mut BufWriter::new(File::create(&file_path).ok()?);
+
+                                  let url = format!("{}/{}", opt.server.as_str(), uri);
+                                  let remote_file = RemoteFile::from(&url)?;
+                                  remote_file.download(local_file)?;
+
+                                  pb.inc(1);
+
+                                  Some(uri)
+                              })
+                              .collect();
+    let ok_uris = ok_uris.iter()
+                         .filter(|v| v.is_some())
+                         .map(|v| v.unwrap())
+                         .collect::<Vec<_>>();
+
+    if !ok_uris.is_empty() {
+        let log_file = &mut BufWriter::new(File::create(&opt.log)?);
+        writeln!(log_file, "{}", ok_uris.join("\n"))?;
+
+        pb.finish_and_clear();
+
+        println!("Done in {}, {}/{} files successfully downloaded and saved (log: {}).",
+                 HumanDuration(started.elapsed()),
+                 ok_uris.len(),
+                 uris.len(),
+                 opt.log.to_string_lossy());
     } else {
-        None
+        println!("nothing downloaded.");
     }
-}
 
-fn download(url: &str) -> Option<String> {
-    let url = Url::parse(url).ok()?;
-    let client = &Client::new();
-    let name = get_name(client, url.clone())?;
-    let length = get_length(client, url.clone())?;
-
-    let pb = ProgressBar::new(length as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-        .progress_chars("#>-"));
-
-    let resp = &mut client.get(url)
-                          .header(header::USER_AGENT, DEFAULT_UA)
-                          .send()
-                          .ok()?;
-
-    let buffer = &mut vec![0u8; BUFFER_SIZE];
-    let file = &mut BufWriter::new(File::create(name.as_str()).ok()?);
-
-    let mut saved_length = 0usize;
-    loop {
-        let count = resp.read(buffer).ok()?;
-        if count == 0 {
-            break
-        }
-        file.write_all(&buffer[0..count]).ok()?;
-        saved_length += count;
-        pb.inc(count as u64);
-    }
-    assert_eq!(length, saved_length);
-
-    Some(name)
-}
-
-fn main() {
-    let args: Vec<_> = env::args().collect();
-    if args.len() > 1 {
-        let url = args[1].as_str();
-        if let Some(file) = concurrent_download(url) {
-            println!("file saved to: {}", file.as_str());
-        }
-    // if let Some(name) = get_name(url) {
-    //     println!("remote name: {} (original url: {})", name, url);
-    // } else {
-    //     println!("remote name not found");
-    // }
-    } else {
-        println!("use: swget url");
-    }
+    Ok(())
 }
