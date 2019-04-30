@@ -2,16 +2,19 @@
 
 use std::{
     fs::{self, File},
-    io::{self, BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
-use reqwest::{header, Client, IntoUrl, StatusCode, Url};
+use reqwest::{
+    header::{self, HeaderMap, HeaderValue},
+    Client, IntoUrl, StatusCode, Url,
+};
 
-use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 
-use rayon::prelude::*;
+use rayon::{prelude::*, ThreadPoolBuilder};
 
 use structopt::StructOpt;
 
@@ -30,12 +33,20 @@ pub struct RemoteFile {
 impl RemoteFile {
     fn from(url: &str) -> Option<Self> {
         let url = Url::parse(url).ok()?;
-        let client = Client::new();
+        let client = {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::USER_AGENT, HeaderValue::from_static(DEFAULT_UA));
+            Client::builder().default_headers(headers)
+                             //  .h2_prior_knowledge()
+                             .build()
+                             .ok()?
+        };
+        // let client = Client::new();
         let resp = client.head(url)
-                         .header(header::USER_AGENT, DEFAULT_UA)
+                         //  .header(header::USER_AGENT, DEFAULT_UA)
                          .send()
                          .ok()?;
-        let url = resp.url();
+        let url = resp.url().to_owned();
         let length = resp.content_length()? as usize;
         let mut name = None;
         if resp.status().is_success() {
@@ -56,9 +67,9 @@ impl RemoteFile {
             }
         }
 
-        if !name.is_none() {
-            Some(RemoteFile { url: url.to_owned(),
-                              name: name.unwrap(),
+        if let Some(name) = name {
+            Some(RemoteFile { url,
+                              name,
                               length,
                               client })
         } else {
@@ -66,14 +77,14 @@ impl RemoteFile {
         }
     }
 
-    fn download(&self, w: &mut impl Write) -> Option<&Path> {
+    fn rdownload(&self, w: &mut impl Write) -> Option<&Path> {
         fn get_ranged_data(client: &Client,
                            url: impl IntoUrl,
                            range: (usize, usize))
                            -> Option<Box<[u8]>> {
             let range_content = format!("bytes={}-{}", range.0, range.1 - 1);
             let resp = &mut client.get(url)
-                                  .header(header::USER_AGENT, DEFAULT_UA)
+                                  //   .header(header::USER_AGENT, DEFAULT_UA)
                                   .header(header::RANGE, range_content.as_str())
                                   .send()
                                   .ok()?;
@@ -86,18 +97,22 @@ impl RemoteFile {
             }
         }
 
-        let ranges = {
-            let mut ranges: Vec<_> =
-                (0..(self.length / BUFFER_SIZE)).map(|i| (i * BUFFER_SIZE, (i + 1) * BUFFER_SIZE))
-                                                .collect();
-            ranges.push((BUFFER_SIZE * (self.length / BUFFER_SIZE), self.length));
-            ranges
-        };
+        // concurrency
+        let data: Option<Vec<_>> = {
+            let ranges = {
+                let mut ranges: Vec<_> = (0..(self.length / BUFFER_SIZE)).map(|i| {
+                                                                             (i * BUFFER_SIZE,
+                                                                              (i + 1) * BUFFER_SIZE)
+                                                                         })
+                                                                         .collect();
+                ranges.push((BUFFER_SIZE * (self.length / BUFFER_SIZE), self.length));
+                ranges
+            };
 
-        let data: Option<Vec<_>> =
             ranges.par_iter()
                   .map(|(from, to)| get_ranged_data(&self.client, self.url.clone(), (*from, *to)))
-                  .collect();
+                  .collect()
+        };
 
         if let Some(buffers) = data {
             let mut saved_length = 0usize;
@@ -111,6 +126,24 @@ impl RemoteFile {
         } else {
             None
         }
+    }
+
+    fn sdownload(&self, w: &mut impl Write) -> Option<&Path> {
+        let resp = &mut self.client.get(self.url.clone()).send().ok()?;
+
+        let buffer = &mut vec![0u8; BUFFER_SIZE];
+        let mut saved_length = 0usize;
+        loop {
+            let count = resp.read(buffer).ok()?;
+            if count == 0 {
+                break
+            }
+            w.write_all(&buffer[0..count]).ok()?;
+            saved_length += count;
+        }
+        assert_eq!(self.length, saved_length);
+
+        Some(self.name.as_path())
     }
 }
 
@@ -134,9 +167,12 @@ struct Opt {
                 help = "PDB server url",
                 default_value = "https://msdl.microsoft.com/download/symbols")]
     server: String,
+
+    #[structopt(short = "n", long = "threads", help = "number of threads")]
+    threads: Option<usize>,
 }
 
-fn main() -> Result<(), io::Error> {
+fn main() -> Result<(), failure::Error> {
     let opt = Opt::from_args();
 
     let started = Instant::now();
@@ -150,11 +186,19 @@ fn main() -> Result<(), io::Error> {
         .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
         .progress_chars("#>-"));
 
+    let pdb_server = opt.server.as_str();
+    let out_dir = &opt.out;
+    let log_file = opt.log.as_path();
+
+    if let Some(thread_num) = opt.threads {
+        ThreadPoolBuilder::new().num_threads(thread_num).build_global()?;
+    }
+
     let ok_uris: Vec<_> = uris.par_iter()
                               .map(|uri| -> Option<&str> {
                                   let uri = uri.as_str();
 
-                                  let file_path = if let Some(outdir) = &opt.out {
+                                  let file_path = if let Some(outdir) = out_dir {
                                       let mut p = outdir.clone();
                                       p.push(uri);
                                       p
@@ -167,9 +211,10 @@ fn main() -> Result<(), io::Error> {
                                   let local_file =
                                       &mut BufWriter::new(File::create(&file_path).ok()?);
 
-                                  let url = format!("{}/{}", opt.server.as_str(), uri);
+                                  let url = format!("{}/{}", pdb_server, uri);
                                   let remote_file = RemoteFile::from(&url)?;
-                                  remote_file.download(local_file)?;
+                                  remote_file.rdownload(local_file)?;
+                                  //   remote_file.sdownload(local_file)?;
 
                                   pb.inc(1);
 
@@ -182,13 +227,13 @@ fn main() -> Result<(), io::Error> {
                          .collect::<Vec<_>>();
 
     if !ok_uris.is_empty() {
-        let log_file = &mut BufWriter::new(File::create(&opt.log)?);
+        let log_file = &mut BufWriter::new(File::create(log_file)?);
         writeln!(log_file, "{}", ok_uris.join("\n"))?;
 
         pb.finish_and_clear();
 
-        println!("Done in {}, {}/{} files successfully downloaded and saved (log: {}).",
-                 HumanDuration(started.elapsed()),
+        println!("Done in {} second(s), {}/{} files successfully downloaded and saved (log: {}).",
+                 started.elapsed().as_secs(),
                  ok_uris.len(),
                  uris.len(),
                  opt.log.to_string_lossy());
