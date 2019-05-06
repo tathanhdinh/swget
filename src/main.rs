@@ -18,6 +18,11 @@ use rayon::{prelude::*, ThreadPoolBuilder};
 
 use structopt::StructOpt;
 
+use strum::{AsStaticRef, IntoEnumIterator};
+use strum_macros::*;
+
+use lazy_static::*;
+
 static DEFAULT_UA: &str =
     "Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:66.0) Gecko/20100101 Firefox/66.0";
 
@@ -147,6 +152,22 @@ impl RemoteFile {
     }
 }
 
+#[derive(AsStaticStr, EnumString, Debug, ToString, EnumIter)]
+enum DownloadMode {
+    #[strum(serialize = "seq")]
+    Sequential,
+
+    #[strum(serialize = "con")]
+    Concurrent,
+}
+
+lazy_static! {
+    static ref DOWNLOAD_MODES_S: Vec<String> =
+        DownloadMode::iter().map(|e| e.to_string()).collect();
+    static ref DOWNLOAD_MODES: Vec<&'static str> =
+        DOWNLOAD_MODES_S.iter().map(|e| e.as_ref()).collect();
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(parse(from_os_str))]
@@ -168,8 +189,16 @@ struct Opt {
                 default_value = "https://msdl.microsoft.com/download/symbols")]
     server: String,
 
-    #[structopt(short = "n", long = "threads", help = "number of threads")]
+    #[structopt(short = "n", long = "threads", help = "number of threads [default: automatic]")]
     threads: Option<usize>,
+
+    #[structopt(short = "m",
+                long = "mode",
+                help = "download mode",
+                raw(possible_values = "&DOWNLOAD_MODES",
+                    case_insensitive = "true",
+                    default_value = "&DownloadMode::Concurrent.as_static()"))]
+    mode: DownloadMode,
 }
 
 fn main() -> Result<(), failure::Error> {
@@ -189,9 +218,11 @@ fn main() -> Result<(), failure::Error> {
     let pdb_server = opt.server.as_str();
     let out_dir = &opt.out;
     let log_file = opt.log.as_path();
+    let download_mode = opt.mode;
 
     if let Some(thread_num) = opt.threads {
-        ThreadPoolBuilder::new().num_threads(thread_num).build_global()?;
+        ThreadPoolBuilder::new().num_threads(thread_num)
+                                .build_global()?;
     }
 
     let ok_uris: Vec<_> = uris.par_iter()
@@ -213,7 +244,16 @@ fn main() -> Result<(), failure::Error> {
 
                                   let url = format!("{}/{}", pdb_server, uri);
                                   let remote_file = RemoteFile::from(&url)?;
-                                  remote_file.rdownload(local_file)?;
+                                  match download_mode {
+                                      DownloadMode::Concurrent => {
+                                          remote_file.rdownload(local_file)?;
+                                      }
+
+                                      DownloadMode::Sequential => {
+                                          remote_file.sdownload(local_file)?;
+                                      }
+                                  }
+                                  //   remote_file.rdownload(local_file)?;
                                   //   remote_file.sdownload(local_file)?;
 
                                   pb.inc(1);
