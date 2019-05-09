@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write, IoSlice},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -120,11 +120,8 @@ impl RemoteFile {
         };
 
         if let Some(buffers) = data {
-            let mut saved_length = 0usize;
-            for b in buffers {
-                w.write_all(&b).ok()?;
-                saved_length += b.len();
-            }
+            let buffer: &Vec<_> = &buffers.iter().map(|b| IoSlice::new(&*b)).collect();
+            let saved_length = w.write_vectored(buffer).ok()?;
             assert_eq!(self.length, saved_length);
 
             Some(self.name.as_path())
