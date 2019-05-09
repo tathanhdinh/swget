@@ -42,13 +42,10 @@ impl RemoteFile {
             let mut headers = HeaderMap::new();
             headers.insert(header::USER_AGENT, HeaderValue::from_static(DEFAULT_UA));
             Client::builder().default_headers(headers)
-                             //  .h2_prior_knowledge()
                              .build()
                              .ok()?
         };
-        // let client = Client::new();
         let resp = client.head(url)
-                         //  .header(header::USER_AGENT, DEFAULT_UA)
                          .send()
                          .ok()?;
         let url = resp.url().to_owned();
@@ -82,14 +79,13 @@ impl RemoteFile {
         }
     }
 
-    fn rdownload(&self, w: &mut impl Write) -> Option<&Path> {
+    fn cdownload(&self, w: &mut impl Write) -> Option<&Path> {
         fn get_ranged_data(client: &Client,
                            url: impl IntoUrl,
                            range: (usize, usize))
                            -> Option<Box<[u8]>> {
             let range_content = format!("bytes={}-{}", range.0, range.1 - 1);
             let resp = &mut client.get(url)
-                                  //   .header(header::USER_AGENT, DEFAULT_UA)
                                   .header(header::RANGE, range_content.as_str())
                                   .send()
                                   .ok()?;
@@ -186,7 +182,9 @@ struct Opt {
                 default_value = "https://msdl.microsoft.com/download/symbols")]
     server: String,
 
-    #[structopt(short = "n", long = "threads", help = "number of threads [default: automatic]")]
+    #[structopt(short = "n",
+                long = "threads",
+                help = "number of threads [default: automatic]")]
     threads: Option<usize>,
 
     #[structopt(short = "m",
@@ -243,15 +241,13 @@ fn main() -> Result<(), failure::Error> {
                                   let remote_file = RemoteFile::from(&url)?;
                                   match download_mode {
                                       DownloadMode::Concurrent => {
-                                          remote_file.rdownload(local_file)?;
+                                          remote_file.cdownload(local_file)?;
                                       }
 
                                       DownloadMode::Sequential => {
                                           remote_file.sdownload(local_file)?;
                                       }
                                   }
-                                  //   remote_file.rdownload(local_file)?;
-                                  //   remote_file.sdownload(local_file)?;
 
                                   pb.inc(1);
 
